@@ -1,207 +1,235 @@
-package com.chavin.util.http;
+/**
+ * Copyright (c) Chavin(chavinchen@hotmail.com). 20019—2022. All rights reserved.
+ */
+package com.chavin.util.http
 
-import android.support.annotation.WorkerThread;
-import android.text.TextUtils;
-import android.util.Log;
-
-import org.json.JSONObject;
-
-import java.io.Closeable;
-import java.io.UnsupportedEncodingException;
-import java.net.URLEncoder;
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.Map;
-import java.util.concurrent.Executor;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
+import org.json.JSONObject
+import java.io.Closeable
+import java.net.URLEncoder
+import java.util.concurrent.Executor
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Created by chenchangwen on 2019-06-27 14:39.
+ * 网络请求的异步包装器
+ *
+ * Created by chavin(chavinchen@hotmail.com) on 2019-06-27 14:39.
  */
-public class HttpUtil {
-    public static final int CODE_EXCEPTION = -1;
-    private static final String TAG = "HttpUtil";
+object ChvHttpUtil {
+    const val CODE_EXCEPTION = ChvRequest.CODE_EXCEPTION
+    const val METHOD_POST = "POST"
+    const val METHOD_GET = "GET"
 
-    private static final String CHARSET_UTF8 = "UTF-8";
-    private static final String METHOD_POST = "POST";
-    private static final String METHOD_GET = "GET";
-
-    static int CONNECT_TIMEOUT_MS = 3000;
-    static int READ_TIMEOUT_MS = 5000;
-
-    private static Executor mExecutor;
-
-    @WorkerThread
-    public interface Callback {
-        void onSucceed(int code, String status, JSONObject header, String body);
-
-        void onFailed(int code, String status, Throwable e);
-    }
+    private const val TAG = "CV-Http"
+    private var CONNECT_TIMEOUT_MS = 3000
+    private var READ_TIMEOUT_MS = 5000
+    private val mLock = Object()
+    private var mAsyncExecutor: Executor? = null
+    private var mCallbackExecutor: Executor? = null
 
     /**
      * 配置
      *
      * @param connectTimeoutMs 最大连接时间
      * @param readTimeoutMs    最大读取时间
-     * @param executor         异步线程池
+     * @param asyncExecutor    异步线程池
      */
-    public static void config(int connectTimeoutMs, int readTimeoutMs, Executor executor) {
-        CONNECT_TIMEOUT_MS = connectTimeoutMs;
-        READ_TIMEOUT_MS = readTimeoutMs;
-        mExecutor = executor;
+    fun config(connectTimeoutMs: Int, readTimeoutMs: Int, asyncExecutor: Executor?, callbackExecutor: Executor?) {
+        CONNECT_TIMEOUT_MS = connectTimeoutMs
+        READ_TIMEOUT_MS = readTimeoutMs
+        mAsyncExecutor = asyncExecutor
+        mCallbackExecutor = callbackExecutor
     }
 
-    public static Closeable get(String url, Callback callback) {
-        return get(url, null, callback);
+    /**
+     * 异步 GET 请求
+     */
+    fun get(url: String, callback: Callback): Closeable {
+        return get(url, null, callback)
     }
 
-    public static Closeable get(String url, JSONObject args, Callback callback) {
-        return get(url, new HashMap<String, String>() {{
-            put("Connection", "Keep-Alive");
-        }}, args, callback);
+    /**
+     * 异步 GET 请求
+     */
+    fun get(url: String, args: JSONObject?, callback: Callback): Closeable {
+        return get(url, HashMap<String, String?>().also { it["Connection"] = "Keep-Alive"; }, args, callback)
     }
 
-
-    public static Closeable get(String url, Map<String, String> header, JSONObject args,
-                                Callback callback) {
-        Request request = new Request(buildUrlWithArgs(url, args));
-        if (null == request.mConnection) {
-            callbackFailed(callback,
-                    request.getStatusCode(), request.getStatusLine(), request.mThrowable);
-            return request;
-        }
-        request.setMethod(METHOD_GET);
-
-        request.addHeaders(header);
-
-        connectAsync(request, callback);
-
-        return request;
-    }
-
-    public static Closeable post(String url, JSONObject args, Callback callback) {
-        return post(url, new HashMap<String, String>() {{
-            put("Connection", "Keep-Alive");
-        }}, args, callback);
-    }
-
-    public static Closeable post(String url, Map<String, String> header, JSONObject args,
-                                 Callback callback) {
-        Request request = new Request(url);
-        if (null == request.mConnection) {
-            callbackFailed(callback,
-                    request.getStatusCode(), request.getStatusLine(), request.mThrowable);
-            return request;
-        }
-        request.setMethod(METHOD_POST);
-
-        request.addHeaders(header);
-
-        request.addArgs(args);
-
-        connectAsync(request, callback);
-
-        return request;
-    }
-
-    static void appendArgs(StringBuilder builder, Iterator<String> keyIterator,
-                                   JSONObject args, boolean needPrefix) {
-        String key;
-        String val;
-        while (keyIterator.hasNext()) {
-            key = keyIterator.next();
-            if (TextUtils.isEmpty(key)) {
-                continue;
+    /**
+     * 异步 GET 请求
+     */
+    fun get(
+        url: String, header: Map<String, String?>?, args: JSONObject?,
+        callback: Callback
+    ): Closeable {
+        val delayed = DelayedCloseable()
+        connectAsync({
+            val req = (object : ChvRequest(buildUrlWithArgs(url, args), CONNECT_TIMEOUT_MS, READ_TIMEOUT_MS) {
+                override fun close() {
+                    super.close()
+                    it.run()
+                }
+            }).method(METHOD_GET)
+            header?.let {
+                req.header(it)
             }
-            if (needPrefix) {
-                builder.append("&");
-            }
-            val = args.optString(key);
-            builder.append(encode(key))
-                    .append("=").append(encode(val));
-            needPrefix = true;
-        }
+            req
+        }, delayed, callback)
+        return delayed
     }
+
+    /**
+     * 异步 POST 请求
+     */
+    fun post(url: String, args: JSONObject?, callback: Callback): Closeable {
+        return post(url, HashMap<String, String?>().also { it["Connection"] = "Keep-Alive"; }, args, callback)
+    }
+
+    /**
+     * 异步 POST 请求
+     */
+    fun post(
+        url: String, header: Map<String, String?>?, args: JSONObject?,
+        callback: Callback
+    ): Closeable {
+        val delayed = DelayedCloseable()
+        connectAsync({
+            val req = (object : ChvRequest(url, CONNECT_TIMEOUT_MS, READ_TIMEOUT_MS) {
+                override fun close() {
+                    super.close()
+                    it.run()
+                }
+            }).method(METHOD_POST)
+            header?.let {
+                req.header(it)
+            }
+            args?.let {
+                req.data(it.toString().toByteArray())
+            }
+            req
+        }, delayed, callback)
+        return delayed
+    }
+
 
     // =================================== PRIVATE =================================================
-
-    private static String buildUrlWithArgs(String url, JSONObject args) {
-        Iterator<String> keyIterator;
-        if (null == args || null == (keyIterator = args.keys()) || keyIterator.hasNext()) {
-            return url;
+    // 将JSON参数添加到URL中
+    private fun buildUrlWithArgs(url: String, args: JSONObject?): String {
+        if (null == args || !args.keys().hasNext()) {
+            return url
         }
-
-        StringBuilder builder = new StringBuilder(url);
-        boolean needPrefix = true;
-        if (-1 != url.indexOf('?')) {
-            builder.append('?');
-            needPrefix = false;
+        val builder = StringBuilder(url)
+        var needPrefix = if (-1 != url.indexOf('?')) {
+            builder.append('?')
+            false
+        } else true
+        val it = args.keys()
+        var k: String?
+        var v: String?
+        while (it.hasNext()) {
+            k = it.next()
+            if (k.isNullOrEmpty()) continue
+            if (needPrefix) builder.append("&")
+            v = args.optString(k)
+            builder.append(URLEncoder.encode(k, Charsets.UTF_8.name()))
+                .append("=").append(URLEncoder.encode(v, Charsets.UTF_8.name()))
+            needPrefix = true
         }
-        appendArgs(builder, keyIterator, args, needPrefix);
-        return builder.toString();
+        return builder.toString()
     }
 
-
-
-    private static void connectAsync(final Request request, final Callback callback) {
-        Log.d(TAG, "connectAsync: " + request + ", " + callback);
-        if (null == mExecutor) {
-            synchronized (HttpUtil.class) {
-                if (null == mExecutor) {
-                    int CPU_COUNT = Runtime.getRuntime().availableProcessors();
-                    int CORE_POOL_SIZE = Math.max(2, Math.min(CPU_COUNT - 1, 4));
-                    int MAXIMUM_POOL_SIZE = CPU_COUNT * 2 + 1;
-                    int KEEP_ALIVE_SECONDS = 30;
-                    ThreadPoolExecutor threadPoolExecutor = new ThreadPoolExecutor(
-                            CORE_POOL_SIZE, MAXIMUM_POOL_SIZE, KEEP_ALIVE_SECONDS, TimeUnit.SECONDS,
-                            new LinkedBlockingQueue<Runnable>(128));
-                    threadPoolExecutor.allowCoreThreadTimeOut(true);
-                    mExecutor = threadPoolExecutor;
+    private fun connectAsync(
+        buildRequest: (onClose: Runnable) -> ChvRequest,
+        closeable: DelayedCloseable,
+        callback: Callback
+    ) {
+        if (null == mAsyncExecutor) {
+            synchronized(mLock) {
+                if (null == mAsyncExecutor) {
+                    val cpuCnt: Int = Runtime.getRuntime().availableProcessors()
+                    val corePoolSize: Int = Math.max(2, Math.min(cpuCnt - 1, 4))
+                    val maximumPoolSize: Int = cpuCnt * 2 + 1
+                    val keepAliveSec = 30
+                    val threadPoolExecutor = ThreadPoolExecutor(
+                        corePoolSize, maximumPoolSize, keepAliveSec.toLong(), TimeUnit.SECONDS,
+                        LinkedBlockingQueue(128)
+                    )
+                    threadPoolExecutor.allowCoreThreadTimeOut(true)
+                    mAsyncExecutor = threadPoolExecutor
                 }
             }
         }
-        mExecutor.execute(new Runnable() {
-            @Override
-            public void run() {
-                Log.d(TAG, "connect start.");
-                request.connect();
-                Log.d(TAG, "connect finished.");
-                if (request.isRequestFailed()) {
-                    callbackFailed(callback,
-                            request.getStatusCode(), request.getStatusLine(), request.mThrowable);
-                } else {
-                    callSucceed(callback,
-                            request.getStatusCode(), request.getStatusLine(),
-                            request.getHeaders(), request.getBody());
-                }
+        mAsyncExecutor!!.execute {
+            ChvLog.log(TAG, "request start.")
+            if (closeable.finished.get()) {
+                ChvLog.log(TAG, "request finished.canceled")
+                callbackCanceled(callback)
+                return@execute
             }
-        });
-    }
-
-    private static String encode(String input) {
-        try {
-            return URLEncoder.encode(input, HttpUtil.CHARSET_UTF8);
-        } catch (UnsupportedEncodingException e) {
-            return input;
+            val request = buildRequest {
+                ChvLog.log(TAG, "request finished.canceled")
+                callbackCanceled(callback)
+            }.also { closeable.target = it }
+            if (request.connect()) {
+                ChvLog.log(TAG, "request finished.succeed")
+                closeable.finished.compareAndSet(false, true)
+                callSucceed(
+                    callback,
+                    request.statusCode(), request.message(),
+                    request.header(), request.body()?.readBytes()?.decodeToString() ?: ChvRequest.EMPTY_STR
+                )
+                request.body()?.close()
+            } else {
+                ChvLog.log(TAG, "request finished.failed")
+                closeable.finished.compareAndSet(false, true)
+                callbackFailed(
+                    callback,
+                    request.statusCode(), request.message(), request.throwable
+                )
+            }
         }
     }
 
-    private static void callbackFailed(Callback callback, int code, String status,
-                                       Throwable e) {
-        if (null == callback) {
-            return;
-        }
-        callback.onFailed(code, status, e);
+    private fun callbackCanceled(callback: Callback) {
+        mCallbackExecutor?.let {
+            it.execute { callback.onCanceled() }
+        } ?: callback.onCanceled()
     }
 
-    private static void callSucceed(Callback callback, int code, String status,
-                                    JSONObject header, String body) {
-        if (null == callback) {
-            return;
-        }
-        callback.onSucceed(code, status, header, body);
+    private fun callbackFailed(
+        callback: Callback, code: Int, status: String?,
+        e: Throwable?
+    ) {
+        mCallbackExecutor?.let {
+            it.execute { callback.onFailed(code, status, e) }
+        } ?: callback.onFailed(code, status, e)
+
     }
 
+    private fun callSucceed(
+        callback: Callback, code: Int, status: String?,
+        header: Map<String, String>, body: String
+    ) {
+        mCallbackExecutor?.let {
+            it.execute { callback.onSucceed(code, status, header, body) }
+        } ?: callback.onSucceed(code, status, header, body)
+    }
+
+    private class DelayedCloseable : Closeable {
+        var finished = AtomicBoolean(false)
+        var target: Closeable? = null
+        override fun close() {
+            if (finished.compareAndSet(false, true)) {
+                target?.close()
+            }
+        }
+    }
+
+    interface Callback {
+        fun onCanceled() {}
+        fun onSucceed(code: Int, status: String?, header: Map<String, String>, body: String?)
+        fun onFailed(code: Int, status: String?, e: Throwable?)
+    }
 }
